@@ -1,6 +1,6 @@
 #!/bin/bash
 #===============================================================================
-# [Lek Do BlacK] - Deploy Minimalista OPSEC v2.0
+# [Lek Do BlacK] - Deploy Minimalista OPSEC v2.1 (CORRIGIDO)
 # Stack: Caddy + FileBrowser + Cloudflare Tunnel + Hardening
 # Uso: curl -sL https://raw.githubusercontent.com/teu-user/repo/main/deploy.sh | sudo bash
 # OU: wget -O deploy.sh URL && chmod +x deploy.sh && sudo ./deploy.sh
@@ -8,18 +8,18 @@
 
 set -euo pipefail
 
-# Cores pra output (opcional, mas ajuda no debug)
+# Cores pra output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 log_info()    { echo -e "${GREEN}[✅]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[⚠️]${NC} $1"; }
 log_error()   { echo -e "${RED}[❌]${NC} $1"; }
 
 #===============================================================================
-# 1. CHECK DE ROOT (FUNCIONA MESMO COM PIPE)
+# 1. CHECK DE ROOT
 #===============================================================================
 if [ "$EUID" -ne 0 ]; then
   log_error "ERRO: Rode com: curl ... | sudo bash  OU  sudo ./deploy.sh"
@@ -32,17 +32,16 @@ log_info "Root confirmado. Iniciando deploy..."
 #===============================================================================
 retry_apt() {
   for i in {1..3}; do
-    if apt update -qq && apt upgrade -y -qq; then
+    if apt update -qq 2>&1 && apt upgrade -y -qq 2>&1; then
       return 0
     else
       log_warn "Tentativa $i de apt falhou, aguardando 5s..."
       sleep 5
-      # Na última tentativa, força desbloqueio
       if [ $i -eq 3 ]; then
         log_warn "Forçando desbloqueio do apt..."
         killall -9 apt apt-get 2>/dev/null || true
         rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*
-        dpkg --configure -a
+        dpkg --configure -a 2>/dev/null || true
         apt update -qq && apt upgrade -y -qq
       fi
     fi
@@ -51,7 +50,7 @@ retry_apt() {
 retry_apt
 
 #===============================================================================
-# 3. LIMPEZA OPSEC (REMOVE TELEMETRIA E AGENTES DESNECESSÁRIOS)
+# 3. LIMPEZA OPSEC
 #===============================================================================
 log_info "Removendo telemetria e agentes AWS..."
 apt remove -y -qq snapd lxd cloud-init cloud-initramfs-* ubuntu-server 2>/dev/null || true
@@ -66,23 +65,22 @@ ufw --force reset >/dev/null 2>&1 || true
 ufw default deny incoming
 ufw default allow outgoing
 
-# SSH: libera localhost + teu IP público (edita se necessário)
+# SSH: localhost + opcional IP público
 ufw allow from 127.0.0.1 to any port 22 proto tcp
-#ufw allow from SEU_IP_PUBLICO/32 to any port 22 proto tcp  # DESCOMENTA E EDITA
+#ufw allow from SEU_IP_PUBLICO/32 to any port 22 proto tcp
 
-# Serviços locais (Caddy + FileBrowser)
-ufw allow from 127.0.0.1 to any port 2015 proto tcp  # Caddy admin
+# Serviços locais
+ufw allow from 127.0.0.1 to any port 2015 proto tcp  # Caddy
 ufw allow from 127.0.0.1 to any port 8080 proto tcp  # FileBrowser
 
-# Bloqueia portas sensíveis outbound (SMTP, DNS externo)
+# Bloqueia outbound sensível
 ufw deny out to any port 25,465,587 proto tcp  # SMTP
-# DNS: usa 1.1.1.1 via tunnel se precisar, ou deixa liberado pra resolução local
 
 ufw --force enable
 log_info "Firewall configurado."
 
 #===============================================================================
-# 5. INSTALAR CADDY (REVERSE PROXY + SSL LOCAL)
+# 5. INSTALAR CADDY
 #===============================================================================
 log_info "Instalando Caddy..."
 if ! command -v caddy &> /dev/null; then
@@ -92,32 +90,26 @@ if ! command -v caddy &> /dev/null; then
   apt update -qq && apt install -y -qq caddy
 fi
 
-# Configura Caddy minimalista
+# Config minimalista do Caddy
 cat > /etc/caddy/Caddyfile << 'CADDY_EOF'
-# Site principal (ajusta o domínio ou usa localhost)
 :2015 {
     bind 127.0.0.1
     root * /var/www/html
     file_server
     encode gzip
-    # Logs desativados pra OPSEC
     log {
         output discard
     }
 }
-
-# Fallback: 404 pra tudo que não casar
 :2016 {
     bind 127.0.0.1
     respond "Not Found" 404
 }
 CADDY_EOF
 
-# Cria diretório web padrão
 mkdir -p /var/www/html
-echo "<h1>🔒 Stack OPSEC ativa</h1>" > /var/www/html/index.html
+echo "<h1>🔒 Stack OPSEC ativa</h1><p>Caddy + FileBrowser + Tunnel</p>" > /var/www/html/index.html
 
-# Testa config e inicia
 if caddy adapt --config /etc/caddy/Caddyfile --validate >/dev/null 2>&1; then
   systemctl enable --now caddy
   log_info "Caddy instalado e rodando em 127.0.0.1:2015"
@@ -127,7 +119,7 @@ else
 fi
 
 #===============================================================================
-# 6. INSTALAR FILEBROWSER (FILE MANAGER LEVE)
+# 6. INSTALAR FILEBROWSER
 #===============================================================================
 log_info "Instalando FileBrowser..."
 if ! command -v filebrowser &> /dev/null; then
@@ -147,7 +139,7 @@ if [ ! -f /etc/filebrowser.db ]; then
     --root /var/www
 fi
 
-# Cria/atualiza user admin (senha aleatória se não definida)
+# Cria/atualiza user admin
 FB_PASS="${FB_ADMIN_PASS:-$(openssl rand -base64 12)}"
 filebrowser users add admin "$FB_PASS" --perm.admin 2>/dev/null || \
 filebrowser users update admin --password "$FB_PASS" 2>/dev/null || true
@@ -174,7 +166,7 @@ log_info "FileBrowser instalado em 127.0.0.1:8080 (user: admin)"
 log_warn "Senha admin: $FB_PASS  # SALVA ISSO AGORA!"
 
 #===============================================================================
-# 7. CLOUDFLARED (TUNNEL) - INSTALAÇÃO (CONFIGURAÇÃO MANUAL DEPOIS)
+# 7. CLOUDFLARED (TUNNEL) - CORRIGIDO COM mkdir -p
 #===============================================================================
 log_info "Instalando Cloudflare Tunnel..."
 if ! command -v cloudflared &> /dev/null; then
@@ -183,12 +175,16 @@ if ! command -v cloudflared &> /dev/null; then
   rm -f /tmp/cf.deb
 fi
 
+# ✅ CRIA A PASTA ANTES DE ESCREVER O ARQUIVO (BUG FIX v2.1)
+mkdir -p /etc/cloudflared
+chmod 700 /etc/cloudflared
+
 # Config padrão (edita depois com teu tunnel ID)
 if [ ! -f /etc/cloudflared/config.yml ]; then
   cat > /etc/cloudflared/config.yml << 'CF_EOF'
-# Edita: tunnel, credentials-file e ingress com teus dados
-# tunnel: TEU_TUNNEL_ID
-# credentials-file: /root/.cloudflared/TEU_TUNNEL_ID.json
+# === EDITA ISSO DEPOIS COM TEUS DADOS ===
+# tunnel: TEU_TUNNEL_ID_AQUI
+# credentials-file: /root/.cloudflared/TEU_TUNNEL_ID_AQUI.json
 #
 # ingress:
 #   - hostname: ajudeagora.sbs
@@ -196,19 +192,26 @@ if [ ! -f /etc/cloudflared/config.yml ]; then
 #   - hostname: files.ajudeagora.sbs
 #     service: http://127.0.0.1:8080
 #   - service: http_status:404
+# =========================================
 CF_EOF
+  chmod 600 /etc/cloudflared/config.yml
   log_warn "Config do tunnel em /etc/cloudflared/config.yml — EDITA ANTES DE INICIAR"
 fi
 
 # Não inicia automático: espera tu configurar o tunnel primeiro
-# systemctl enable --now cloudflared  # DESCOMENTA DEPOIS DE CONFIGURAR
+log_info "Cloudflared instalado. Configure o tunnel manualmente:"
+log_info "  1. cloudflared tunnel login"
+log_info "  2. cloudflared tunnel create minimal-stack"
+log_info "  3. Edita /etc/cloudflared/config.yml com teu tunnel ID"
+log_info "  4. cloudflared tunnel route dns minimal-stack teudominio.com"
+log_info "  5. systemctl enable --now cloudflared"
 
 #===============================================================================
-# 8. HARDENING OPSEC (LOGS, OUTBOUND, CLEANUP)
+# 8. HARDENING OPSEC
 #===============================================================================
 log_info "Aplicando hardening OPSEC..."
 
-# Desativa logs desnecessários do systemd
+# Journald minimalista
 mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/opsec.conf << 'JOURNAL_EOF'
 [Journal]
@@ -217,7 +220,7 @@ MaxRetentionSec=1day
 RateLimitIntervalSec=30s
 RateLimitBurst=10000
 JOURNAL_EOF
-systemctl restart systemd-journald
+systemctl restart systemd-journald 2>/dev/null || true
 
 # Rotação agressiva de logs
 cat > /etc/logrotate.d/opsec-minimal << 'LOGROTATE_EOF'
@@ -236,13 +239,13 @@ cat > /etc/logrotate.d/opsec-minimal << 'LOGROTATE_EOF'
 }
 LOGROTATE_EOF
 
-# Cron de limpeza diária (3AM)
+# Cron de limpeza diária
 if ! crontab -l 2>/dev/null | grep -q "opsec-cleanup"; then
   (crontab -l 2>/dev/null; echo "0 3 * * * find /var/log -name '*.log' -mtime +2 -delete 2>/dev/null || true # opsec-cleanup") | crontab -
 fi
 
-# Desativa IPv6 (reduz fingerprint)
-if ! grep -q "disable_ipv6" /etc/sysctl.conf; then
+# Desativa IPv6
+if ! grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
   echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
   echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
   sysctl -p >/dev/null 2>&1 || true
@@ -256,45 +259,36 @@ log_info "Hardening aplicado."
 log_info "Criando script de backup mínimo..."
 cat > /usr/local/bin/backup-opsec.sh << 'BACKUP_EOF'
 #!/bin/bash
-# Backup minimalista OPSEC - usa rclone se configurado
 set -e
-
 BACKUP_DIR="/tmp/backup-$(date +%F-%H%M)"
 mkdir -p "$BACKUP_DIR"
-
-# O que backupar
 tar czf "$BACKUP_DIR/etc.tar.gz" /etc/caddy /etc/filebrowser.db /etc/cloudflared 2>/dev/null || true
 tar czf "$BACKUP_DIR/www.tar.gz" /var/www 2>/dev/null || true
-
-# Se rclone configurado, envia pra remote
-if command -v rclone &> /dev/null && rclone listremotes | grep -q .; then
+if command -v rclone &> /dev/null && rclone listremotes 2>/dev/null | grep -q .; then
   rclone copy "$BACKUP_DIR" remote:backup-opsec/ --progress 2>/dev/null || log_warn "Rclone sync falhou"
 fi
-
-# Limpa local após 24h
 find /tmp -name "backup-*" -mtime +1 -delete 2>/dev/null || true
 BACKUP_EOF
 chmod +x /usr/local/bin/backup-opsec.sh
 
-# Agenda backup diário (4AM)
 if ! crontab -l 2>/dev/null | grep -q "backup-opsec"; then
   (crontab -l 2>/dev/null; echo "0 4 * * * /usr/local/bin/backup-opsec.sh >> /var/log/backup-opsec.log 2>&1 # backup-opsec") | crontab -
 fi
 log_info "Backup script agendado (4AM diário)."
 
 #===============================================================================
-# 10. KERNEL REBOOT WARNING (NÃO BLOQUEANTE)
+# 10. KERNEL REBOOT WARNING
 #===============================================================================
 if [ -f /var/run/reboot-required ]; then
   log_warn "Kernel atualizado. Reboot recomendado (não obrigatório): sudo reboot"
 fi
 
 #===============================================================================
-# 11. RESUMO FINAL + PRÓXIMOS PASSOS
+# 11. RESUMO FINAL
 #===============================================================================
 echo ""
 echo "==============================================================================="
-echo "  [🔥] DEPLOY CONCLUÍDO - STACK MINIMALISTA OPSEC v2.0"
+echo "  [🔥] DEPLOY CONCLUÍDO - STACK MINIMALISTA OPSEC v2.1"
 echo "==============================================================================="
 echo "  📁 FileBrowser:  http://127.0.0.1:8080  | user: admin | pass: $FB_PASS"
 echo "  🌐 Caddy:        http://127.0.0.1:2015  (serve /var/www/html)"
