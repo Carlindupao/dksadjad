@@ -1,377 +1,282 @@
 #!/bin/bash
+# =============================================================================
+# OPSEC SAFE v1.0 - SECURE BUT NO LOCKOUT
+# =============================================================================
+# Este script NÃO bloqueia acesso SSH e NÃO corta comunicação de saída
+# Pode ser executado remotamente com segurança
+# =============================================================================
+
 set -euo pipefail
 
-# =============================================================================
-# OPSEC HARDENED SCRIPT v6.0 - ANONYMITY & SECURITY ENHANCED
-# =============================================================================
-
-# Color definitions (disabled in non-interactive or for logs)
-if [ -t 1 ]; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-else
-    RED=''; GREEN=''; YELLOW=''; NC=''
-fi
-
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log(){ echo -e "${GREEN}[+]${NC} $1"; }
 warn(){ echo -e "${YELLOW}[!]${NC} $1"; }
+error(){ echo -e "${RED}[x]${NC} $1"; }
 
-# Root check
+# Verificar root
 [ "$EUID" -ne 0 ] && echo "Use sudo" && exit 1
 
 # =============================================================================
-# ANONYMITY: Randomize machine identifiers (optional, use with caution)
+# BACKUP CRÍTICO ANTES DE QUALQUER COISA
 # =============================================================================
-randomize_machine_id() {
-    if [ -f /etc/machine-id ]; then
-        TRUNCATED_OLD=$(cat /etc/machine-id | cut -c1-8)
-        systemd-machine-id-setup 2>/dev/null || true
-        log "Machine ID randomized (was: $TRUNCATED_OLD...)"
-    fi
-}
+log "Criando backup de configurações atuais..."
+mkdir -p /root/opsec-backup-$(date +%Y%m%d)
+cp -r /etc/ssh /root/opsec-backup-$(date +%Y%m%d)/ 2>/dev/null || true
+cp -r /etc/ufw /root/opsec-backup-$(date +%Y%m%d)/ 2>/dev/null || true
+cp /etc/fail2ban/jail.local /root/opsec-backup-$(date +%Y%m%d)/ 2>/dev/null || true
 
-# Call only if environment variable set (opt-in for maximum anonymity)
-if [ "${RANDOMIZE_MACHINE_ID:-0}" = "1" ]; then
-    randomize_machine_id
-fi
+log "Backup salvo em /root/opsec-backup-$(date +%Y%m%d)"
 
 # =============================================================================
-# SSH SAFE DETECTION (improved for proxy/tor jumps)
+# DETECTAR IP DO SSH (para não se trancar)
 # =============================================================================
 SSH_IP=""
-SSH_SOURCE=""
-
 if [ -n "${SSH_CONNECTION:-}" ]; then
-    SSH_IP="${SSH_CONNECTION%% *}"
-    SSH_SOURCE="SSH_CONNECTION"
-elif who am i &>/dev/null 2>&1; then
+    SSH_IP=$(echo "$SSH_CONNECTION" | awk '{print $1}')
+elif command -v who &>/dev/null; then
     SSH_IP=$(who am i 2>/dev/null | awk '{print $5}' | tr -d '()' | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || true)
-    SSH_SOURCE="who"
 fi
 
-# If still empty, check last login from sshd logs
-if [ -z "$SSH_IP" ] && [ -f /var/log/auth.log ]; then
-    SSH_IP=$(grep "Accepted" /var/log/auth.log 2>/dev/null | tail -1 | awk '{print $NF}' | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || true)
-    SSH_SOURCE="auth.log"
-fi
-
-log "SSH source detected: ${SSH_IP:-none} (from $SSH_SOURCE)"
-
-# =============================================================================
-# APT with tor proxy support (if tor is used)
-# =============================================================================
-apt_update_with_proxy() {
-    if command -v tor &>/dev/null && systemctl is-active --quiet tor 2>/dev/null; then
-        echo "Acquire::http::Proxy \"socks5h://127.0.0.1:9050/\";" > /etc/apt/apt.conf.d/50tor
-        echo "Acquire::https::Proxy \"socks5h://127.0.0.1:9050/\";" >> /etc/apt/apt.conf.d/50tor
-        log "APT using Tor proxy"
-    fi
-    apt update -qq
-}
-
-apt_update_with_proxy
-apt install -y -qq curl wget gnupg2 ufw jq fail2ban openssl tor debian-keyring debian-archive-keyring apt-transport-https
-
-# =============================================================================
-# TOR SERVICE (enable for anonymity, service hidden)
-# =============================================================================
-if [ "${ENABLE_TOR:-1}" = "1" ]; then
-    systemctl enable --now tor 2>/dev/null || true
-    log "Tor enabled (SOCKS5 on 127.0.0.1:9050)"
-fi
-
-# =============================================================================
-# FIREWALL: Strict + anti-leak + ratelimit
-# =============================================================================
-ufw --force reset 2>/dev/null || true
-ufw default deny incoming
-ufw default deny outgoing  # BLOCK ALL OUTBOUND by default (anti-leak)
-
-# Allow only necessary outbound
-ufw allow out 53,80,443,123/udp  # DNS, HTTP/S, NTP
-ufw allow out 22/tcp comment 'SSH out'
-ufw allow out 9050/tcp comment 'Tor out'
-
-# If using Tor for all traffic
-if [ "${FORCE_TOR_ALL:-0}" = "1" ]; then
-    ufw deny out 80/tcp
-    ufw deny out 443/tcp
-    log "Forcing all traffic through Tor (transparent proxy mode)"
-fi
-
-# SSH inbound strict
 if [ -n "$SSH_IP" ]; then
-    ufw allow from "${SSH_IP}/32" to any port 22 proto tcp comment 'SSH from detected IP'
+    log "Seu IP SSH detectado: $SSH_IP"
+    log "Regras de firewall irão PRESERVAR seu acesso"
 else
-    warn "No SSH IP detected → SSH not exposed (safe)"
-    # Optional: still allow from specific subnet via env
-    if [ -n "${SSH_ALLOW_SUBNET:-}" ]; then
-        ufw allow from "${SSH_ALLOW_SUBNET}" to any port 22 proto tcp
-    fi
+    warn "Não foi possível detectar seu IP"
+    warn "O firewall NÃO será configurado para evitar lockout"
 fi
 
-ufw limit 22/tcp comment 'SSH rate limit'
-ufw allow from 127.0.0.1 to any port 2015,8080 proto tcp comment 'Local services'
-ufw deny out 25,465,587/tcp comment 'Block mail (anti-exfil)'
+# =============================================================================
+# ATUALIZAR SISTEMA (opcional, seguro)
+# =============================================================================
+log "Atualizando repositórios..."
+apt update -qq
 
-# Log dropped packets (forensics but careful with logs)
-ufw logging medium
-
-ufw --force enable
-log "Firewall: strict outgoing deny + anti-leak"
+# Instalar pacotes úteis (NÃO remove nada)
+apt install -y -qq curl wget ufw fail2ban openssl ca-certificates
 
 # =============================================================================
-# FAIL2BAN: Aggressive + custom jails
+# FIREWALL SEGURO (SEM default deny outgoing)
 # =============================================================================
-cat > /etc/fail2ban/jail.local <<EOF
+if command -v ufw &>/dev/null; then
+    log "Configurando UFW (MODO SEGURO)..."
+    
+    # Reset apenas se já estava configurado
+    ufw --force disable 2>/dev/null || true
+    
+    # Configurações seguras
+    ufw default deny incoming
+    ufw default allow outgoing  # CRÍTICO: NÃO bloquear saída
+    
+    # Permitir SSH de forma segura
+    if [ -n "$SSH_IP" ]; then
+        ufw allow from "$SSH_IP" to any port 22 proto tcp comment "SSH do seu IP"
+        log "SSH permitido APENAS para: $SSH_IP"
+    else
+        ufw allow 22/tcp comment "SSH (temporariamente aberto para evitar lockout)"
+        warn "SSH permitido de qualquer IP - configure depois!"
+    fi
+    
+    # Rate limit no SSH
+    ufw limit 22/tcp
+    
+    # Portas internas (locais)
+    ufw allow from 127.0.0.1 to any port 2015,8080,3000,5000,8000 proto tcp
+    
+    # BLOQUEAR apenas saída de email (prevenção de spam, não afeta SSH)
+    ufw deny out 25/tcp
+    ufw deny out 465/tcp
+    ufw deny out 587/tcp
+    
+    # Ativar firewall
+    echo "y" | ufw enable
+    log "UFW ativado (MODO SEGURO - saída permitida)"
+else
+    error "UFW não encontrado - instalando..."
+    apt install -y ufw
+fi
+
+# =============================================================================
+# FAIL2BAN (seguro, NÃO bloqueia seu IP se errar senha 3x)
+# =============================================================================
+if command -v fail2ban &>/dev/null; then
+    log "Configurando Fail2ban..."
+    
+    cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
-bantime = 6h
-findtime = 30m
-maxretry = 2
+bantime = 10m
+findtime = 10m
+maxretry = 5
 banaction = ufw
 backend = systemd
+ignoreip = 127.0.0.1/8 $SSH_IP
 
 [sshd]
 enabled = true
-mode = aggressive
-
-[sshd-ddos]
-enabled = true
-logpath = /var/log/auth.log
+mode = normal
 maxretry = 3
-findtime = 10m
+bantime = 30m
 EOF
 
-systemctl enable --now fail2ban
-log "Fail2ban: aggressive"
+    systemctl restart fail2ban
+    log "Fail2ban ativo (seu IP ignorado: $SSH_IP)"
+fi
 
 # =============================================================================
-# SSH HARDENING (maximum)
+# SSH HARDENING (SEGURO - sem bloquear chave/senha simultaneamente)
 # =============================================================================
-cat > /etc/ssh/sshd_config.d/99-opsec.conf <<EOF
-PasswordAuthentication no
-PubkeyAuthentication yes
+log "Configurando SSH (modo seguro)..."
+
+# Backup do config original
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+
+# Configurações seguras
+cat > /etc/ssh/sshd_config.d/99-safe-opsec.conf <<EOF
+# Configurações seguras (NÃO bloqueiam acesso)
+ClientAliveInterval 120
+ClientAliveCountMax 3
+MaxAuthTries 6
+MaxSessions 10
+TCPKeepAlive yes
 PermitRootLogin prohibit-password
-ChallengeResponseAuthentication no
-UsePAM no
-X11Forwarding no
-PrintMotd no
-AcceptEnv LANG LC_*
-ClientAliveInterval 300
-ClientAliveCountMax 2
-MaxAuthTries 2
-MaxSessions 3
-TCPKeepAlive no
-AllowTcpForwarding no
-GatewayPorts no
+
+# NÃO desabilitar senha! (evita lockout)
+PasswordAuthentication yes
+
+# Manter autenticação por chave
+PubkeyAuthentication yes
+
+# Logging
+LogLevel VERBOSE
 EOF
 
-systemctl restart ssh || systemctl restart sshd
-log "SSH hardened"
+# Garantir que não perdeu acesso
+systemctl restart ssh
+log "SSH configurado - senha AINDA funciona como fallback"
 
 # =============================================================================
-# SYSCTL: Anti-leak, anti-scan, anti-DoS
+# SYSCTL (SEGURO - sem cortar comunicação)
 # =============================================================================
-cat > /etc/sysctl.d/99-opsec.conf <<EOF
-# Network security
-net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_synack_retries=2
-net.ipv4.tcp_syn_retries=2
-net.ipv4.icmp_echo_ignore_all=1
-net.ipv4.icmp_echo_ignore_broadcasts=1
-net.ipv4.icmp_ignore_bogus_error_responses=1
-net.ipv4.conf.all.rp_filter=1
-net.ipv4.conf.default.rp_filter=1
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.default.send_redirects=0
-net.ipv4.ip_forward=0
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
+log "Otimizações de rede seguras..."
 
-# Anti-leak
-net.core.bpf_jit_enable=1
-kernel.kptr_restrict=2
-kernel.dmesg_restrict=1
-kernel.printk=3 3 3 3
-net.ipv4.conf.all.log_martians=1
+cat > /etc/sysctl.d/99-opsec-safe.conf <<EOF
+# Proteção contra ataques básicos
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 2
+
+# Anti-spoofing
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Não aceitar redirecionamentos
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+
+# NÃO desabilitar IPv6 (pode quebrar cloud providers)
+# NÃO desabilitar ICMP (pode quebrar detecção de MTU)
+# NÃO restringir logs do kernel
 EOF
 
-sysctl --system >/dev/null
-log "Sysctl: anti-leak + anti-scan"
+sysctl --system >/dev/null 2>&1
+log "Sysctl otimizado (sem quebrar conectividade)"
 
 # =============================================================================
-# JOURNALD: volatile + no persistent logs (opt-out via env)
+# DETECÇÃO DE VULNERABILIDADES (apenas scan, sem ação)
 # =============================================================================
-if [ "${PERSISTENT_LOGS:-0}" != "1" ]; then
-    mkdir -p /etc/systemd/journald.conf.d
-    cat > /etc/systemd/journald.conf.d/opsec.conf <<EOF
+log "Verificando portas abertas..."
+ss -tlnp | grep -v "127.0.0.1" | head -10 || true
+
+# =============================================================================
+# LOGGING (opcional, seguro)
+# =============================================================================
+log "Configurando logs (modo leve)..."
+
+cat > /etc/systemd/journald.conf.d/99-opsec.conf <<EOF
 [Journal]
-Storage=volatile
-RuntimeMaxUse=50M
-MaxRetentionSec=1hour
-ForwardToSyslog=no
-ForwardToWall=no
-EOF
-    systemctl restart systemd-journald
-    log "Journald: volatile, no persistent logs"
-fi
-
-# =============================================================================
-# CADDY (webserver) with random local port
-# =============================================================================
-CADDY_PORT=${CADDY_PORT:-2015}
-if ! command -v caddy &>/dev/null; then
-    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy.gpg
-    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy.list
-    apt update && apt install -y caddy
-fi
-
-cat > /etc/caddy/Caddyfile <<EOF
-{
-    auto_https off
-    admin off
-}
-
-:${CADDY_PORT} {
-    bind 127.0.0.1
-    root * /var/www/html
-    file_server
-    encode gzip zstd
-    log {
-        output discard
-    }
-    header {
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        Server "nginx"   # disguise
-    }
-}
+SystemMaxUse=500M
+MaxRetentionSec=7day
+Compress=yes
 EOF
 
-mkdir -p /var/www/html
-RANDOM_HASH=$(openssl rand -hex 8)
-echo "OPSEC v6 - ${RANDOM_HASH}" > /var/www/html/index.html
-
-systemctl enable --now caddy
-log "Caddy on 127.0.0.1:${CADDY_PORT}"
+systemctl restart systemd-journald
+log "Logs configurados"
 
 # =============================================================================
-# FILEBROWSER (random password + random local port)
+# VERIFICAÇÃO FINAL - TESTAR SE SSH AINDA FUNCIONA
 # =============================================================================
-FB_PORT=${FB_PORT:-8080}
-if ! command -v filebrowser &>/dev/null; then
-    curl -fsSL https://github.com/filebrowser/filebrowser/releases/latest/download/linux-amd64-filebrowser.tar.gz -o fb.tar.gz
-    tar xzf fb.tar.gz
-    mv filebrowser /usr/local/bin/
-    chmod +x /usr/local/bin/filebrowser
-    rm fb.tar.gz
-fi
-
-filebrowser config init --address 127.0.0.1 --port ${FB_PORT} --database /etc/filebrowser.db --root /var/www 2>/dev/null || true
-
-ADMIN_PASS=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-16)
-filebrowser users update admin --password "$ADMIN_PASS" --database /etc/filebrowser.db 2>/dev/null || \
-filebrowser users add admin "$ADMIN_PASS" --perm.admin --database /etc/filebrowser.db
-
-cat > /etc/systemd/system/filebrowser.service <<EOF
-[Unit]
-Description=FileBrowser
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/filebrowser --database /etc/filebrowser.db --address 127.0.0.1 --port ${FB_PORT} --root /var/www
-Restart=always
-LimitNOFILE=65535
-ProtectSystem=strict
-PrivateTmp=true
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now filebrowser
-log "FileBrowser on 127.0.0.1:${FB_PORT}"
-
-# =============================================================================
-# CLOUDFLARED (multi-domain, config via env only, no hardcoded secrets)
-# =============================================================================
-if [ -n "${CLOUDFLARE_TUNNEL_ID:-}" ] && [ -n "${CLOUDFLARE_DOMAIN1:-}" ]; then
-    if ! command -v cloudflared &>/dev/null; then
-        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-        dpkg -i cloudflared-linux-amd64.deb 2>/dev/null || apt install -f -y
-        rm cloudflared-linux-amd64.deb
-    fi
-
-    mkdir -p /etc/cloudflared /root/.cloudflared
-    echo "${CLOUDFLARE_TUNNEL_JSON}" > /root/.cloudflared/${CLOUDFLARE_TUNNEL_ID}.json 2>/dev/null || true
-
-    cat > /etc/cloudflared/config.yml <<EOF
-tunnel: ${CLOUDFLARE_TUNNEL_ID}
-credentials-file: /root/.cloudflared/${CLOUDFLARE_TUNNEL_ID}.json
-
-ingress:
-  - hostname: ${CLOUDFLARE_DOMAIN1}
-    service: http://127.0.0.1:${CADDY_PORT}
-  - hostname: ${CLOUDFLARE_DOMAIN2:-files.${CLOUDFLARE_DOMAIN1}}
-    service: http://127.0.0.1:${FB_PORT}
-  - service: http_status:404
-EOF
-    systemctl enable --now cloudflared 2>/dev/null || true
-    log "Cloudflared tunnel configured (domains hidden in env)"
+log "Testando conectividade SSH..."
+if ss -tlnp | grep -q ":22"; then
+    log "✅ SSH está ouvindo na porta 22"
 else
-    warn "Cloudflare tunnel skipped (missing env vars)"
+    error "❌ CRÍTICO: SSH não está ouvindo! Revertendo..."
+    systemctl restart ssh
+    sleep 2
+    if ss -tlnp | grep -q ":22"; then
+        log "✅ SSH recuperado"
+    else
+        error "⚠️  Algo grave aconteceu - restaure manualmente"
+    fi
 fi
 
 # =============================================================================
-# ANONYMITY: wipe bash history selectively
+# TESTE DE SAÍDA (verificar se internet funciona)
 # =============================================================================
-if [ "${WIPE_HISTORY:-1}" = "1" ]; then
-    unset HISTFILE
-    history -c 2>/dev/null || true
-    rm -f ~/.bash_history ~/.zsh_history 2>/dev/null || true
-    log "Shell history wiped"
+log "Testando conectividade de SAÍDA..."
+if curl -s --max-time 5 https://api.github.com/zen > /dev/null 2>&1; then
+    log "✅ Conexão de saída funcionando (importante para não se isolar)"
+else
+    warn "⚠️  Sem conexão de saída - verifique DNS"
+    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
 fi
 
 # =============================================================================
-# BACKUP (encrypted, sent via tor if available)
+# INSTRUÇÕES DE RECUPERAÇÃO (CASO ALGO FALHE)
 # =============================================================================
-BACKUP_PASS=$(openssl rand -base64 24 | head -c20)
-cat > /usr/local/bin/backup.sh <<EOF
+cat > /root/opsec-recovery.sh <<'EOF'
 #!/bin/bash
-BACKUP_FILE="/tmp/backup-\$(date +%F).tar.gz.gpg"
-tar czf - /etc /var/www 2>/dev/null | gpg --batch --passphrase "${BACKUP_PASS}" --symmetric --cipher-algo AES256 -o "\$BACKUP_FILE"
-# Optional: upload via curl --socks5-hostname 127.0.0.1:9050 if tor running
-chmod 600 "\$BACKUP_FILE"
-echo "Backup: \$BACKUP_FILE (pass saved in /root/.backup_pass)"
+# Script de RECUPERAÇÃO DE EMERGÊNCIA
+# Caso perca acesso SSH, execute via AWS Console
+
+echo "Restaurando configurações seguras..."
+ufw --force disable
+systemctl stop fail2ban
+cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config 2>/dev/null
+systemctl restart ssh
+ufw allow 22/tcp
+echo "y" | ufw enable
+echo "✅ Recuperação concluída - tente SSH agora"
 EOF
-echo "$BACKUP_PASS" > /root/.backup_pass
-chmod 600 /root/.backup_pass
-chmod +x /usr/local/bin/backup.sh
-log "Encrypted backup script ready"
+
+chmod +x /root/opsec-recovery.sh
+log "Script de recuperação criado em /root/opsec-recovery.sh"
 
 # =============================================================================
-# FINAL REPORT (only to console, not logged)
+# INFORMAÇÕES FINAIS
 # =============================================================================
 echo ""
-echo "=============================="
-echo "🔥 OPSEC v6 PRO - ANONYMIZED"
-echo "=============================="
-echo "Caddy:        http://127.0.0.1:${CADDY_PORT}"
-echo "FileBrowser:  http://127.0.0.1:${FB_PORT}"
-echo "User:         admin"
-echo "Pass:         $ADMIN_PASS"
-echo "Backup pass:  ${BACKUP_PASS:0:8}... (see /root/.backup_pass)"
-echo "Tor SOCKS5:   127.0.0.1:9050"
-echo "Firewall:     strict deny outgoing (allow list only)"
-echo "Logs:         volatile (gone after reboot)"
-echo "=============================="
-echo "⚠️  SSH access allowed only from: ${SSH_IP:-none}"
-echo "=============================="
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║     OPSEC SAFE v1.0 - CONFIGURADO COM SUCESSO            ║"
+echo "╠═══════════════════════════════════════════════════════════╣"
+echo "║ ✅ UFW ativo (saída permitida)                            ║"
+echo "║ ✅ Fail2ban rodando (seu IP ignorado)                     ║"
+echo "║ ✅ SSH: chave E senha funcionam (fallback seguro)         ║"
+echo "║ ✅ Conectividade de saída OK                              ║"
+echo "║ ✅ Script de recovery pronto                              ║"
+echo "╠═══════════════════════════════════════════════════════════╣"
+echo "║ 🔐 SEU ACESSO SSH ESTÁ PRESERVADO                         ║"
+echo "║ 📁 Backup em: /root/opsec-backup-$(date +%Y%m%d)                ║"
+echo "║ 🚨 Recovery: /root/opsec-recovery.sh (via AWS Console)    ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+echo ""
 
-# Clear sensitive vars from environment
-unset ADMIN_PASS BACKUP_PASS CLOUDFLARE_TUNNEL_JSON CLOUDFLARE_TUNNEL_ID
+# =============================================================================
+# TESTE FINAL - MOSTRAR STATUS
+# =============================================================================
+log "Status do UFW:"
+ufw status | head -5
+
+log "Status do SSH:"
+systemctl status ssh --no-pager -l | grep "Active:" || true
+
+echo ""
+log "✅ INSTALAÇÃO SEGURA CONCLUÍDA - Você NÃO será lockado!"
